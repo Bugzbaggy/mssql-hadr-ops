@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path ./MssqlHadrOps -Recurse -Severity Error,Warning
+          if ($results) {
+            $results | Format-Table -AutoSize | Out-String | Write-Host
+            $errors = @($results | Where-Object Severity -eq 'Error')
+            if ($errors.Count -gt 0) {
+              Write-Host "::error::$($errors.Count) analyzer error(s)"
+              exit 1
+            }
+          }
+          Write-Host 'PSScriptAnalyzer: no errors.'
+
+  manifest:
+    name: Manifest + parse
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Test-ModuleManifest resolves RequiredModules and fails if they are not
+      # installed, so on a bare runner it reports "the specified RequiredModules
+      # entry 'dbatools' is invalid" — a false negative about the manifest.
+      # Installing dbatools here would cost minutes for no extra signal, so parse
+      # the manifest directly and assert the things that actually rot: the
+      # declared exports and the RootModule must match what is on disk.
+      - name: Validate module manifest
+        shell: pwsh
+        run: |
+          $psd1 = './MssqlHadrOps/MssqlHadrOps.psd1'
+          $m = Import-PowerShellDataFile $psd1
+          Write-Host "Module:  $($m.RootModule)"
+          Write-Host "Version: $($m.ModuleVersion)"
+          Write-Host "Guid:    $($m.GUID)"
+
+          $failed = $false
+
+          $root = Join-Path (Split-Path $psd1) $m.RootModule
+          if (-not (Test-Path $root)) {
+            Write-Host "::error::RootModule '$($m.RootModule)' does not exist"; $failed = $true
+          }
+
+          $declared = @($m.FunctionsToExport) | Sort-Object
+          $onDisk = @(Get-ChildItem ./MssqlHadrOps/Public -Filter *.ps1 |
+                      ForEach-Object { $_.BaseName }) | Sort-Object
+
+          $missing = @($declared | Where-Object { $_ -notin $onDisk })
+          $unexported = @($onDisk | Where-Object { $_ -notin $declared })
+
+          foreach ($f in $missing) {
+            Write-Host "::error::FunctionsToExport lists '$f' but Public/$f.ps1 does not exist"
+            $failed = $true
+          }
+          foreach ($f in $unexported) {
+            Write-Host "::error::Public/$f.ps1 exists but is not in FunctionsToExport"
+            $failed = $true
+          }
+
+          if ($failed) { exit 1 }
+          Write-Host "Manifest OK: $($declared.Count) exported function(s) all present."
+
+      - name: Parse every script
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1,*.psm1,*.psd1 | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$null, [ref]$errs)
+            if ($errs) {
+              Write-Host "::error file=$($_.Name)::$($errs[0].Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+          Write-Host 'All scripts parsed.'
+
+  leak-scan:
+    name: No internal identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for internal identifiers
+        run: bash ci/leak-scan.sh
