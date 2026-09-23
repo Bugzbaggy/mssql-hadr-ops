@@ -37,7 +37,7 @@
     Run Set-MssqlOpsPagerDutyUserApiToken once per server to populate the vault.
 .PARAMETER PagerDutyServiceId
     PagerDuty service id used for the maintenance window. Defaults to the
-    module-level value set in MssqlHadrOps.psm1 ('PYZ6V1U' - AppDb Messaging
+    module-level value set in MssqlHadrOps.psm1 ('PDSERVICE' - AppDb Messaging
     Database). Override only when targeting a different service.
 .PARAMETER MaintenanceDurationMinutes
     Length of the PagerDuty maintenance window in minutes. Default: 30.

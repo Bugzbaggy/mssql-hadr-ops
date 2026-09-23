@@ -16,7 +16,7 @@ Import-Module FailoverClusters -ErrorAction Stop
 # Default PagerDuty service id used by functions that open/close maintenance
 # windows. Public functions accept -PagerDutyServiceId to override per-call;
 # this is just the central default so the value lives in one place.
-$script:PagerDutyServiceId = 'PYZ6V1U'   # AppDb Messaging Database
+$script:PagerDutyServiceId = 'PDSERVICE'   # AppDb Messaging Database
 
 $public  = @(Get-ChildItem -Path "$PSScriptRoot\Public"  -Filter '*.ps1' -ErrorAction SilentlyContinue)
 $private = @(Get-ChildItem -Path "$PSScriptRoot\Private" -Filter '*.ps1' -ErrorAction SilentlyContinue)
