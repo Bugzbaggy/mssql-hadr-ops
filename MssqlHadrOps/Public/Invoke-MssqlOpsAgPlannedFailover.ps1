@@ -14,7 +14,9 @@
     Validation steps:
       1. Local node is PRIMARY for exactly one AG.
       2. Exactly one synchronous-commit secondary is currently SYNCHRONIZED.
-      3. WSFC quorum is healthy (all nodes Up, witness online, votes >= majority).
+      3. WSFC quorum is healthy (all nodes Up, witness online, votes >= majority)
+         AND the AG listener's network topology can actually host the listener
+         IP on the target node.
       4. Per-database DB_CHAINING flag is identical on both replicas.
       5. Every AG database is SYNCHRONIZED with log_send_queue and redo_queue
          below the configured thresholds.
@@ -35,7 +37,7 @@
     Run Set-MssqlOpsPagerDutyUserApiToken once per server to populate the vault.
 .PARAMETER PagerDutyServiceId
     PagerDuty service id used for the maintenance window. Defaults to the
-    module-level value set in MssqlHadrOps.psm1 ('PYZ6V1U' - AppDb Messaging
+    module-level value set in MssqlHadrOps.psm1 ('PDSERVICE' - AppDb Messaging
     Database). Override only when targeting a different service.
 .PARAMETER MaintenanceDurationMinutes
     Length of the PagerDuty maintenance window in minutes. Default 30.
@@ -44,11 +46,37 @@
     Bypass the WSFC + witness + AG readiness gate added in 2.1. Use only when
     you have a documented reason to override (e.g. you're failing over BECAUSE
     the cluster is degraded). Default off.
+.PARAMETER SkipListenerNetworkGate
+    Bypass the AG listener network gate added in 2.6
+    (Test-MssqlOpsAgListenerNetwork). That gate refuses the failover when the
+    listener's IP resource cannot come online on the target node - a dangling
+    cluster-network reference, a listener IP outside its network's subnet, a node
+    with two interfaces on one cluster network, an AWS ENI that does not carry
+    the listener IP, or mismatched NLB probe ports. Use only when you have
+    confirmed the finding is a false positive. Default off.
+.PARAMETER SkipListenerEniCheck
+    Narrower override: run the listener network gate but skip only its IMDSv2 ENI
+    membership probe (check 4). Use on a firewalled host or when WinRM to the
+    peer node is unavailable, so the structural checks still run.
 .NOTES
-    Version:        2.5
-    Last Modified:  2026-08-18
+    Version:        2.6
+    Last Modified:  2026-09-22
     Author:         original module author
-    Changes:        2.5 - Step 5 (per-db sync/queue) now reads the HADR DMVs via
+    Changes:        2.6 - Added AG listener network gate
+                          (Test-MssqlOpsAgListenerNetwork) inside step 3, after
+                          the cluster readiness gate. Closes the gap exposed by
+                          the staging ag-staging1 incident (2026-09-14 ->
+                          2026-09-22): all five existing validations PASSED on
+                          every one of the seven failed failover attempts,
+                          because they only look at SQL replica state and
+                          cluster quorum. Nothing checked whether the listener
+                          IP resource could bind on the target node.
+                          STAGING-NODE2 had two NICs in one subnet, so WSFC
+                          folded them into a single cluster network and bound
+                          ag-staging1_192.0.2.130 to the wrong interface, whose
+                          ENI never carried that address; the AG went to
+                          RESOLVING on every attempt.
+                    2.5 - Step 5 (per-db sync/queue) now reads the HADR DMVs via
                           Invoke-Sqlcmd instead of the non-existent
                           Get-DbaAgDatabaseReplicaState cmdlet. Query validated
                           against the live SG cluster (returns all 10 AG DBs for
@@ -91,10 +119,12 @@ function Invoke-MssqlOpsAgPlannedFailover {
         [string]$PagerDutyApiKey,
         [string]$PagerDutyServiceId       = $script:PagerDutyServiceId,
         [int]$MaintenanceDurationMinutes  = 30,
-        [switch]$SkipClusterReadinessGate
+        [switch]$SkipClusterReadinessGate,
+        [switch]$SkipListenerNetworkGate,
+        [switch]$SkipListenerEniCheck
     )
 
-    $FunctionVersion = "2.5"
+    $FunctionVersion = "2.6"
     $TotalSteps      = if ($Failover) { 8 } else { 5 }
 
     $NodeName      = $env:COMPUTERNAME
@@ -174,14 +204,18 @@ function Invoke-MssqlOpsAgPlannedFailover {
     Write-Host " -> PASS: Target replica is '$TargetInstance'." -ForegroundColor Green
 
     # -------------------------------------------------------------------------
-    # STEP 3: WSFC + witness + cross-AG readiness, then quorum vote math
+    # STEP 3: WSFC + witness + cross-AG readiness, listener network, quorum math
     #   The cluster readiness gate (added 2.1) closes the gaps exposed by the
     #   ID 2026-06-08 RESOLVING incident: SMB reachability of the witness
     #   from this node, peer-Paused interlock, and Resolving-AG interlock.
-    #   The vote math after it is the original 2.0 check, still useful as a
+    #   The listener network gate (added 2.6) answers the question none of the
+    #   other checks ask: can the listener's IP resource actually come ONLINE on
+    #   the target node? On staging it could not, for eight days, while all five
+    #   validations here passed.
+    #   The vote math after both is the original 2.0 check, still useful as a
     #   defense-in-depth quorum-majority audit.
     # -------------------------------------------------------------------------
-    Write-Host "`n[3/$TotalSteps] Verifying WSFC quorum..." -ForegroundColor Yellow
+    Write-Host "`n[3/$TotalSteps] Verifying WSFC quorum and listener network..." -ForegroundColor Yellow
 
     if ($SkipClusterReadinessGate) {
         Write-Host "    Cluster readiness gate SKIPPED by -SkipClusterReadinessGate." -ForegroundColor Yellow
@@ -197,6 +231,31 @@ function Invoke-MssqlOpsAgPlannedFailover {
             }
             throw "Cluster readiness gate failed; refusing planned failover. Pass -SkipClusterReadinessGate to override (rare; only when you're failing over BECAUSE the cluster is degraded)."
         }
+    }
+
+    # Listener network gate. Fail-closed: a listener IP that cannot bind on the
+    # target node produces an AG stuck in RESOLVING and a listener name that
+    # answers nowhere, which is worse than not failing over at all.
+    if ($SkipListenerNetworkGate) {
+        Write-Host "    Listener network gate SKIPPED by -SkipListenerNetworkGate." -ForegroundColor Yellow
+    } else {
+        $netGate = Test-MssqlOpsAgListenerNetwork -AvailabilityGroup $ag.Name -SkipEniCheck:$SkipListenerEniCheck
+        foreach ($w in $netGate.Warnings) {
+            Write-Host "    WARN: $w" -ForegroundColor DarkYellow
+        }
+        if ($netGate.Checks) {
+            $netGate.Checks |
+                Select-Object Resource, Address, State, ClusterNetwork, ProbePort, InterfacesPerNode, Verdict |
+                Format-Table -AutoSize | Out-String | Write-Host
+        }
+        if (-not $netGate.Healthy) {
+            Write-Host " -> FAIL: AG listener network gate:" -ForegroundColor Red
+            foreach ($f in $netGate.Failures) {
+                Write-Host "    - $f" -ForegroundColor Red
+            }
+            throw "AG listener network gate failed; refusing planned failover. The listener IP would not come online on '$TargetInstance' and the AG would land in RESOLVING. Pass -SkipListenerNetworkGate only after confirming the finding is a false positive."
+        }
+        Write-Host "    Listener network OK (IP resources map to a live cluster network, one interface per node, addresses present on the ENI)." -ForegroundColor Green
     }
 
     try {

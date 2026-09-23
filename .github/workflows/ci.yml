@@ -94,6 +94,28 @@ jobs:
           if ($failed) { exit 1 }
           Write-Host 'All scripts parsed.'
 
+  pester:
+    name: Pester tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships an old Pester (3.x) for Windows PowerShell only;
+      # pwsh needs 5.x installed explicitly, same as the PSScriptAnalyzer job.
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -Force -MinimumVersion 5.0.0 -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path    = './tests'
+          $config.Run.Exit    = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
   leak-scan:
     name: No internal identifiers
     runs-on: ubuntu-latest

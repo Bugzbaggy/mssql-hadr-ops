@@ -19,7 +19,7 @@
     Run Set-MssqlOpsPagerDutyUserApiToken once per server to populate the vault.
 .PARAMETER PagerDutyServiceId
     PagerDuty service id whose maintenance window should be closed. Defaults to
-    the module-level value set in MssqlHadrOps.psm1 ('PYZ6V1U' - AppDb
+    the module-level value set in MssqlHadrOps.psm1 ('PDSERVICE' - AppDb
     Messaging Database). Override only when targeting a different service.
 .PARAMETER ClusterRejoinTimeoutSeconds
     How long to wait for the WSFC node to reach a stable State='Up' before
